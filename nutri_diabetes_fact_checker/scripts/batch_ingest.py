@@ -1,96 +1,114 @@
+"""
+batch_ingest.py — Ingestão em larga escala de documentos no ChromaDB.
+
+Lê TODOS os formatos suportados (.pdf e .txt) da pasta de guidelines,
+faz chunking, gera embeddings com modelo MULTILÍNGUE e insere em lotes.
+"""
 import os
 import hashlib
 from tqdm import tqdm
-from langchain_community.document_loaders import TextLoader
+from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 
-def generate_chunk_id(chunk_text, source_name):
-    """Gera um ID único (hash) para o chunk baseado no texto e fonte para evitar duplicidade"""
-    content_to_hash = f"{source_name}_{chunk_text}".encode('utf-8')
-    return hashlib.md5(content_to_hash).hexdigest()
+# Modelo multilíngue — essencial para textos em português
+EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-def process_pdfs_in_directory(raw_dir, chunk_size=1000, chunk_overlap=100):
-    """Lê todos os PDFs e retorna os chunks com metadata atualizada."""
-    all_chunks = []
-    
-    text_splitter = RecursiveCharacterTextSplitter(
+
+def generate_chunk_id(chunk_text: str, source_name: str) -> str:
+    """Hash MD5 do conteúdo + fonte para deduplicação."""
+    payload = f"{source_name}::{chunk_text}".encode("utf-8")
+    return hashlib.md5(payload).hexdigest()
+
+
+def load_document(file_path: str):
+    """Escolhe o loader correto com base na extensão."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        return PyMuPDFLoader(file_path).load()
+    elif ext == ".txt":
+        return TextLoader(file_path, encoding="utf-8").load()
+    else:
+        print(f"  ⚠ Formato não suportado: {ext} — ignorando {file_path}")
+        return []
+
+
+def process_documents(raw_dir: str, chunk_size=800, chunk_overlap=120):
+    """Lê todos os PDFs e TXTs do diretório e retorna chunks enriquecidos."""
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ".", " ", ""]
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
-    
-    pdf_files = [f for f in os.listdir(raw_dir) if f.lower().endswith('.txt')]
-    print(f"Encontrados {len(pdf_files)} TXTs no diretório.")
-    
-    for filename in tqdm(pdf_files, desc="Processando Documentos"):
-        file_path = os.path.join(raw_dir, filename)
+
+    supported = (".pdf", ".txt")
+    files = [f for f in os.listdir(raw_dir)
+             if os.path.splitext(f)[1].lower() in supported]
+    print(f"Encontrados {len(files)} documentos em {raw_dir}")
+
+    all_chunks = []
+    for fname in tqdm(files, desc="Processando documentos"):
+        fpath = os.path.join(raw_dir, fname)
         try:
-            loader = TextLoader(file_path, encoding='utf-8')
-            documents = loader.load()
-            chunks = text_splitter.split_documents(documents)
-            
-            for chunk in chunks:
-                # Enriquece o metadata
-                chunk.metadata['source_file'] = filename
-                chunk.metadata['chunk_id'] = generate_chunk_id(chunk.page_content, filename)
-                all_chunks.append(chunk)
+            docs = load_document(fpath)
+            chunks = splitter.split_documents(docs)
+            for c in chunks:
+                c.metadata["source_file"] = fname
+                c.metadata["chunk_id"] = generate_chunk_id(c.page_content, fname)
+            all_chunks.extend(chunks)
         except Exception as e:
-            print(f"Erro ao processar {filename}: {e}")
-            
+            print(f"  ✗ Erro em {fname}: {e}")
+
     return all_chunks
 
-def batch_ingest_chroma(chunks, persist_directory, batch_size=200):
-    """Realiza a ingestão no ChromaDB em lotes."""
+
+def batch_ingest_chroma(chunks, persist_dir: str, batch_size=200):
+    """Insere chunks no ChromaDB em lotes, sem duplicar."""
     if not chunks:
         print("Nenhum chunk para ingerir.")
-        return
-        
-    print("Inicializando embeddings (HuggingFace)...")
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    
-    # Inicializa ou carrega a vector store
-    vectorstore = Chroma(
-        persist_directory=persist_directory,
-        embedding_function=embeddings
-    )
-    
-    # Extrai IDs existentes para não duplicar
-    # Note: O Chroma gerencia IDs se passados explicitamente.
-    # Vamos extrair apenas os chunks únicos
-    unique_chunks = {chunk.metadata['chunk_id']: chunk for chunk in chunks}
-    chunks_to_insert = list(unique_chunks.values())
-    ids = list(unique_chunks.keys())
-    
-    print(f"Total de chunks a serem analisados/inseridos: {len(chunks_to_insert)}")
-    
-    for i in tqdm(range(0, len(chunks_to_insert), batch_size), desc="Ingerindo Lotes no ChromaDB"):
-        batch = chunks_to_insert[i:i + batch_size]
-        batch_ids = ids[i:i + batch_size]
-        
-        # Tentar inserir no ChromaDB passando os IDs explícitos.
-        # O Chroma geralmente sobrescreve ou ignora IDs repetidos dependendo da versão,
-        # mas forçar os IDs ajuda no controle de versão do documento.
-        try:
-            vectorstore.add_documents(documents=batch, ids=batch_ids)
-        except Exception as e:
-            print(f"Erro no lote {i}-{i+batch_size}: {e}")
+        return None
 
-    print("Processo de ingestão em larga escala concluído.")
+    print(f"Carregando modelo de embeddings: {EMBEDDING_MODEL}")
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
+    vectorstore = Chroma(
+        persist_directory=persist_dir,
+        embedding_function=embeddings,
+    )
+
+    # Deduplica por chunk_id
+    unique = {c.metadata["chunk_id"]: c for c in chunks}
+    docs = list(unique.values())
+    ids = list(unique.keys())
+    print(f"Chunks únicos a inserir: {len(docs)}")
+
+    for i in tqdm(range(0, len(docs), batch_size), desc="Ingerindo lotes"):
+        batch_docs = docs[i : i + batch_size]
+        batch_ids = ids[i : i + batch_size]
+        try:
+            vectorstore.add_documents(documents=batch_docs, ids=batch_ids)
+        except Exception as e:
+            print(f"  ✗ Erro no lote {i}–{i+batch_size}: {e}")
+
+    print("✔ Ingestão concluída.")
+    return vectorstore
+
 
 def main():
-    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    RAW_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "raw", "guidelines")
-    CHROMA_DB_DIR = os.path.join(PROJECT_ROOT, "knowledge_base", "chromadb")
-    
-    if not os.path.exists(RAW_DATA_DIR):
-        os.makedirs(RAW_DATA_DIR, exist_ok=True)
-        print(f"Diretório {RAW_DATA_DIR} criado. Por favor, baixe PDFs ou rode o crawler.py antes.")
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    raw_dir = os.path.join(project_root, "data", "raw", "guidelines")
+    chroma_dir = os.path.join(project_root, "knowledge_base", "chromadb")
+
+    if not os.path.exists(raw_dir):
+        os.makedirs(raw_dir, exist_ok=True)
+        print(f"Diretório criado: {raw_dir}")
+        print("Adicione PDFs ou TXTs lá, ou rode o scraper.py primeiro.")
         return
-        
-    chunks = process_pdfs_in_directory(RAW_DATA_DIR)
-    batch_ingest_chroma(chunks, CHROMA_DB_DIR)
+
+    chunks = process_documents(raw_dir)
+    batch_ingest_chroma(chunks, chroma_dir)
+
 
 if __name__ == "__main__":
     main()
